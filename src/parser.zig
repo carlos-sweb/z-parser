@@ -23,6 +23,27 @@ pub const ParseError = error{
 
 const ArgList = struct { args: []const *Node, end: usize };
 
+/// Result of a `FunctionHooks` callback: an opaque, arena-allocated node
+/// plus its precise end position (z-parser can't read `.end` off the
+/// opaque node itself without dereferencing it, which it must never do).
+pub const FunctionHookResult = struct { node: *anyopaque, end: usize };
+
+/// Hooks a dependent repo (z-functions) installs so this parser can produce
+/// function/arrow-function expression nodes from inside its own private
+/// recursive-descent functions without knowing anything about function
+/// bodies (statement lists) at compile time. Null by default -- every
+/// existing call site's behavior is unchanged when no hooks are installed.
+pub const FunctionHooks = struct {
+    ctx: *anyopaque,
+    /// Called once `parseAssignment` has already confirmed (via its own
+    /// lookahead) that an arrow function follows. `parser.current` is
+    /// positioned at the first token of the parameter list (either the
+    /// lone identifier of `a => ...`, or the `(` of `(...) => ...`).
+    parseArrowFunction: *const fn (ctx: *anyopaque, parser: *Parser) ParseError!FunctionHookResult,
+    /// Called from `parsePrimary` when `parser.current.type == .keyword_function`.
+    parseFunctionExpression: *const fn (ctx: *anyopaque, parser: *Parser) ParseError!FunctionHookResult,
+};
+
 /// `/` is either division or the start of a RegExpLiteral depending on
 /// grammar position (ECMA-262 12.1's InputElementRegExp vs InputElementDiv).
 /// False (division) after anything that can end a complete expression;
@@ -155,6 +176,7 @@ pub const Parser = struct {
     lexer: Lexer,
     arena: Allocator,
     current: Token,
+    function_hooks: ?FunctionHooks = null,
 
     pub fn init(arena: Allocator, source: []const u8) ParseError!Parser {
         var self: Parser = .{
@@ -187,6 +209,56 @@ pub const Parser = struct {
         const tok = self.current;
         try self.advance();
         return tok;
+    }
+
+    /// Peeks the type of the token *after* `self.current` without consuming
+    /// it, via the lexer-position rewind idiom (save `lexer.{pos,line,column}`
+    /// + `current`, advance once, read, restore everything).
+    pub fn peekNextType(self: *Parser) ParseError!TokenType {
+        const saved_pos = self.lexer.pos;
+        const saved_line = self.lexer.line;
+        const saved_column = self.lexer.column;
+        const saved_current = self.current;
+        defer {
+            self.lexer.pos = saved_pos;
+            self.lexer.line = saved_line;
+            self.lexer.column = saved_column;
+            self.current = saved_current;
+        }
+        try self.advance();
+        return self.current.type;
+    }
+
+    /// Pure token-skipping scan (not a real parse): from `self.current ==
+    /// .punct_lparen`, counts paren depth to find the matching `)`, then
+    /// checks whether the token right after it is `=>`. Fully rewound
+    /// regardless of outcome -- this only *disambiguates*; the real
+    /// parameter-list parsing happens afterward, for real, via a
+    /// `FunctionHooks.parseArrowFunction` call starting fresh from the
+    /// original `(`.
+    fn scanConfirmsArrow(self: *Parser) ParseError!bool {
+        const saved_pos = self.lexer.pos;
+        const saved_line = self.lexer.line;
+        const saved_column = self.lexer.column;
+        const saved_current = self.current;
+        defer {
+            self.lexer.pos = saved_pos;
+            self.lexer.line = saved_line;
+            self.lexer.column = saved_column;
+            self.current = saved_current;
+        }
+        var depth: i32 = 1;
+        try self.advance(); // past the opening '('
+        while (depth > 0) {
+            switch (self.current.type) {
+                .punct_lparen => depth += 1,
+                .punct_rparen => depth -= 1,
+                .eof => return false,
+                else => {},
+            }
+            try self.advance();
+        }
+        return self.current.type == .punct_arrow;
     }
 
     fn newNode(self: *Parser, start: usize, end: usize, data: NodeData) ParseError!*Node {
@@ -222,6 +294,18 @@ pub const Parser = struct {
     }
 
     fn parseAssignment(self: *Parser) ParseError!*Node {
+        if (self.function_hooks) |h| {
+            if (self.current.type == .identifier and try self.peekNextType() == .punct_arrow) {
+                const start = self.current.start;
+                const result = try h.parseArrowFunction(h.ctx, self);
+                return self.newNode(start, result.end, .{ .function_like = result.node });
+            }
+            if (self.current.type == .punct_lparen and try self.scanConfirmsArrow()) {
+                const start = self.current.start;
+                const result = try h.parseArrowFunction(h.ctx, self);
+                return self.newNode(start, result.end, .{ .function_like = result.node });
+            }
+        }
         const left = try self.parseConditional();
         if (assignOpFor(self.current.type)) |op| {
             if (!isValidAssignmentTarget(left)) return ParseError.InvalidAssignmentTarget;
@@ -515,6 +599,10 @@ pub const Parser = struct {
             },
             .punct_lbracket => return self.parseArrayLiteral(),
             .punct_lbrace => return self.parseObjectLiteral(),
+            .keyword_function => if (self.function_hooks) |h| {
+                const result = try h.parseFunctionExpression(h.ctx, self);
+                return self.newNode(tok.start, result.end, .{ .function_like = result.node });
+            } else return ParseError.UnexpectedToken,
             else => return ParseError.UnexpectedToken,
         }
     }

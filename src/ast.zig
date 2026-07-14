@@ -110,4 +110,8 @@ pub const NodeData = union(enum) {
     /// `new Foo()`, which has args.len == 0).
     new_expr: struct { callee: *Node, args: ?[]const *Node },
     member: struct { object: *Node, property: *Node, computed: bool, optional: bool },
+    /// A function/arrow-function expression node, typed and owned solely by
+    /// z-functions -- this repo never dereferences it. See z-functions'
+    /// `asFunctionNode()`.
+    function_like: *anyopaque,
 };
