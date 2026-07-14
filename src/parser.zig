@@ -26,10 +26,12 @@ const ArgList = struct { args: []const *Node, end: usize };
 /// `/` is either division or the start of a RegExpLiteral depending on
 /// grammar position (ECMA-262 12.1's InputElementRegExp vs InputElementDiv).
 /// False (division) after anything that can end a complete expression;
-/// true (regex) everywhere else. `}` is deliberately NOT included here: it
-/// can end either an object literal (division should follow) or a block
-/// statement (regex should follow), and this phase has no statement/block
-/// parsing yet to disambiguate -- revisit once that exists.
+/// true (regex) everywhere else. `}` falls into the `true` (regex) default:
+/// most `}` occurrences close a block/switch/try-catch-finally, after which
+/// a fresh statement begins and a leading `/` is a regex. The one place `}`
+/// closes an object literal instead (where division should follow) is
+/// disambiguated explicitly at that call site via `advanceWithContext`
+/// (see `parseObjectLiteral`), not through this default.
 fn regexAllowedAfter(t: TokenType) bool {
     return switch (t) {
         .identifier,
@@ -164,12 +166,23 @@ pub const Parser = struct {
         return self;
     }
 
-    fn advance(self: *Parser) ParseError!void {
+    pub fn advance(self: *Parser) ParseError!void {
         const ctx: LexContext = if (regexAllowedAfter(self.current.type)) .regex_allowed else .div_allowed;
+        try self.advanceWithContext(ctx);
+    }
+
+    /// Same as `advance`, but with an explicit `LexContext` instead of the
+    /// one `regexAllowedAfter` infers from the outgoing token. Needed at the
+    /// handful of call sites where the outgoing token's regex-vs-division
+    /// context is ambiguous from its type alone (see `parseObjectLiteral`'s
+    /// closing `}`) or where a caller in a dependent repo (e.g. a future
+    /// statement parser) needs to drive the lexer through a context this
+    /// parser has no way to infer on its own.
+    pub fn advanceWithContext(self: *Parser, ctx: LexContext) ParseError!void {
         self.current = try self.lexer.nextToken(ctx);
     }
 
-    fn expect(self: *Parser, t: TokenType) ParseError!Token {
+    pub fn expect(self: *Parser, t: TokenType) ParseError!Token {
         if (self.current.type != t) return ParseError.UnexpectedToken;
         const tok = self.current;
         try self.advance();
@@ -199,6 +212,14 @@ pub const Parser = struct {
     }
 
     // ===== Assignment / Conditional / Short-circuit (&&, ||, ??) =====
+
+    /// Public entry point for the AssignmentExpression production (no comma
+    /// operator) -- needed by grammar positions that are spec'd one level
+    /// below full `Expression`, e.g. a variable declarator's initializer or
+    /// a `for-of` loop's iterable clause.
+    pub fn parseAssignmentExpression(self: *Parser) ParseError!*Node {
+        return self.parseAssignment();
+    }
 
     fn parseAssignment(self: *Parser) ParseError!*Node {
         const left = try self.parseConditional();
@@ -539,7 +560,10 @@ pub const Parser = struct {
             if (self.current.type != .punct_rbrace) _ = try self.expect(.punct_comma);
         }
         const end = self.current.end;
-        try self.advance();
+        // This `}` closes an object literal, not a block -- division, not
+        // regex, follows (e.g. `({}) / 2`). Explicit, not inferred: see
+        // `regexAllowedAfter`'s doc comment.
+        try self.advanceWithContext(.div_allowed);
         return self.newNode(start, end, .{ .object_literal = try elements.toOwnedSlice(self.arena) });
     }
 
