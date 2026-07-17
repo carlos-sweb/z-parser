@@ -12,6 +12,7 @@ pub const ObjectLiteralElement = ast_mod.ObjectLiteralElement;
 
 pub const Parser = parser_mod.Parser;
 pub const ParseError = parser_mod.ParseError;
+pub const isValidAssignmentPattern = parser_mod.isValidAssignmentPattern;
 pub const FunctionHooks = parser_mod.FunctionHooks;
 pub const FunctionHookResult = parser_mod.FunctionHookResult;
 

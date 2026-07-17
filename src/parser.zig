@@ -84,6 +84,65 @@ fn isValidAssignmentTarget(node: *Node) bool {
     };
 }
 
+/// ECMA-262's cover-grammar reinterpretation, as a validator instead of a
+/// second parse: an array/object *literal* on the left of plain `=` is
+/// re-checked element by element for AssignmentPattern shape. Only `=`
+/// destructures -- compound ops (`[a] += x`) stay InvalidAssignmentTarget,
+/// per the real spec. `pub` because z-statements reuses this to validate
+/// `for ([a, b] of x)` / `for ([a, b] in o)` heads over existing bindings.
+pub fn isValidAssignmentPattern(node: *Node) bool {
+    switch (node.data) {
+        .array_literal => |elements| {
+            for (elements, 0..) |maybe_el, i| {
+                const el = maybe_el orelse continue; // elision hole
+                if (el.data == .spread) {
+                    // Rest: must be last, no default (`[...a = []] = x` is
+                    // a real SyntaxError), target or nested pattern.
+                    if (i != elements.len - 1) return false;
+                    if (!isValidPatternElement(el.data.spread, false)) return false;
+                    continue;
+                }
+                if (!isValidPatternElement(el, true)) return false;
+            }
+            return true;
+        },
+        .object_literal => |elements| {
+            for (elements, 0..) |el, i| {
+                switch (el) {
+                    .property => |prop| {
+                        // Shorthand `{a}` -- key and value are the same
+                        // identifier node, already a valid target.
+                        if (!isValidPatternElement(prop.value, true)) return false;
+                    },
+                    .spread => |sp| {
+                        // Object rest: identifier/member only, must be
+                        // last. (The element holds a `.spread` node
+                        // wrapping the argument, same as evaluation sees.)
+                        if (i != elements.len - 1) return false;
+                        const arg = sp.data.spread;
+                        if (arg.data != .identifier and arg.data != .member) return false;
+                    },
+                }
+            }
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// One target position inside an assignment pattern. Parenthesized simple
+/// targets (`[(a)] = x`) are legal; parenthesized *patterns* (`([a]) = x`)
+/// are not -- so `.paren` unwraps to the simple-target rule only.
+fn isValidPatternElement(node: *Node, allow_default: bool) bool {
+    return switch (node.data) {
+        .identifier, .member => true,
+        .paren => isValidAssignmentTarget(node),
+        .array_literal, .object_literal => isValidAssignmentPattern(node),
+        .assignment => |a| allow_default and a.op == .assign and isValidPatternElement(a.target, false),
+        else => false,
+    };
+}
+
 fn assignOpFor(t: TokenType) ?ast.AssignOp {
     return switch (t) {
         .punct_assign => .assign,
@@ -308,7 +367,11 @@ pub const Parser = struct {
         }
         const left = try self.parseConditional();
         if (assignOpFor(self.current.type)) |op| {
-            if (!isValidAssignmentTarget(left)) return ParseError.InvalidAssignmentTarget;
+            const target_ok = if (op == .assign and (left.data == .array_literal or left.data == .object_literal))
+                isValidAssignmentPattern(left)
+            else
+                isValidAssignmentTarget(left);
+            if (!target_ok) return ParseError.InvalidAssignmentTarget;
             try self.advance();
             const right = try self.parseAssignment(); // right-associative
             return self.newNode(left.start, right.end, .{ .assignment = .{ .op = op, .target = left, .value = right } });

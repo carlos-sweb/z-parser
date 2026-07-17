@@ -51,6 +51,45 @@ test "invalid assignment targets are rejected" {
     try helpers.expectParseError("(a, b) = 1", zparser.ParseError.InvalidAssignmentTarget);
 }
 
+test "array/object literals are valid targets of plain = (cover-grammar reinterpretation)" {
+    try helpers.parseAndCheck("[a, b] = c", {}, struct {
+        fn check(_: void, node: *zparser.Node) !void {
+            try testing.expect(node.data == .assignment);
+            try testing.expectEqual(zparser.AssignOp.assign, node.data.assignment.op);
+            try testing.expect(node.data.assignment.target.data == .array_literal);
+        }
+    }.check);
+    try helpers.parseAndCheck("({a: b.c} = d)", {}, struct {
+        fn check(_: void, node: *zparser.Node) !void {
+            try testing.expect(node.data.paren.data == .assignment);
+            try testing.expect(node.data.paren.data.assignment.target.data == .object_literal);
+        }
+    }.check);
+    // Pattern-shaped contents that are all legal: holes, defaults,
+    // nesting, member targets, rests.
+    try helpers.parseAndCheck("[, a, o.x, [b], {c}, d = 1, ...r] = e", {}, struct {
+        fn check(_: void, node: *zparser.Node) !void {
+            try testing.expect(node.data == .assignment);
+        }
+    }.check);
+}
+
+test "invalid destructuring assignment patterns are rejected like real SyntaxErrors" {
+    // A literal on the left of = with non-target contents.
+    try helpers.expectParseError("[1] = x", zparser.ParseError.InvalidAssignmentTarget);
+    try helpers.expectParseError("[a + b] = x", zparser.ParseError.InvalidAssignmentTarget);
+    // Parenthesized patterns are invalid (parenthesized simple targets aren't).
+    try helpers.expectParseError("([a]) = x", zparser.ParseError.InvalidAssignmentTarget);
+    // Only plain = destructures.
+    try helpers.expectParseError("[a] += x", zparser.ParseError.InvalidAssignmentTarget);
+    // Rest must be last and defaultless.
+    try helpers.expectParseError("[...a, b] = x", zparser.ParseError.InvalidAssignmentTarget);
+    try helpers.expectParseError("[...a = []] = x", zparser.ParseError.InvalidAssignmentTarget);
+    // Object rest is identifier/member only and must be last.
+    try helpers.expectParseError("({...{a}} = x)", zparser.ParseError.InvalidAssignmentTarget);
+    try helpers.expectParseError("({...r, a} = x)", zparser.ParseError.InvalidAssignmentTarget);
+}
+
 test "ternary conditional, right-associative nesting" {
     try helpers.parseAndCheck("a ? b : c ? d : e", {}, struct {
         fn check(_: void, node: *zparser.Node) !void {
