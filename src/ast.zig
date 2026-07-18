@@ -123,6 +123,14 @@ pub const NodeData = union(enum) {
     /// A class expression node, typed and owned solely by z-functions --
     /// this repo never dereferences it. See z-functions' `asClassNode()`.
     class_like: *anyopaque,
+    /// `yield` / `yield expr` -- only parsed inside generator bodies
+    /// (Parser.yield_allowed, set by z-functions). `yield*` delegation
+    /// is deferred.
+    yield_expr: struct { argument: ?*Node },
+    /// `await expr` -- only parsed inside async function bodies
+    /// (Parser.await_allowed); elsewhere `await` stays an ordinary
+    /// identifier (it's contextual, not a keyword).
+    await_expr: *Node,
     /// The `super` keyword in expression position. Only meaningful as a
     /// call callee (`super(...)`) or member object (`super.m`) inside
     /// class bodies -- both shapes fall out of the ordinary call/member

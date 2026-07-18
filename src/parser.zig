@@ -253,6 +253,13 @@ pub const Parser = struct {
     arena: Allocator,
     current: Token,
     function_hooks: ?FunctionHooks = null,
+    /// `yield` is grammatical only inside generator bodies; z-functions
+    /// sets this around each body parse (nested non-generator bodies
+    /// turn it back off -- the real scoping rule).
+    yield_allowed: bool = false,
+    /// Same contract for `await` inside async function bodies. Off, the
+    /// contextual `await` stays an ordinary identifier.
+    await_allowed: bool = false,
 
     pub fn init(arena: Allocator, source: []const u8) ParseError!Parser {
         var self: Parser = .{
@@ -370,6 +377,28 @@ pub const Parser = struct {
     }
 
     fn parseAssignment(self: *Parser) ParseError!*Node {
+        // YieldExpression sits at AssignmentExpression level in the real
+        // grammar. Outside generator bodies `yield` is simply reserved
+        // (consistent with the engine's always-strict stance).
+        if (self.current.type == .keyword_yield) {
+            if (!self.yield_allowed) return ParseError.UnexpectedToken;
+            const start = self.current.start;
+            var end = self.current.end;
+            try self.advance();
+            var argument: ?*Node = null;
+            // Argument-less yield: a terminator follows, or ASI's
+            // restricted-production rule (newline right after `yield`).
+            const can_start = switch (self.current.type) {
+                .punct_semi, .punct_rparen, .punct_rbrace, .punct_rbracket, .punct_comma, .punct_colon, .eof => false,
+                else => !self.current.had_line_terminator_before,
+            };
+            if (can_start) {
+                const a = try self.parseAssignment();
+                argument = a;
+                end = a.end;
+            }
+            return self.newNode(start, end, .{ .yield_expr = .{ .argument = argument } });
+        }
         if (self.function_hooks) |h| {
             if (self.current.type == .identifier and try self.peekNextType() == .punct_arrow) {
                 const start = self.current.start;
@@ -495,6 +524,16 @@ pub const Parser = struct {
     // ===== Unary / postfix =====
 
     fn parseUnary(self: *Parser) ParseError!*Node {
+        // `await` is a contextual identifier that becomes a unary-level
+        // operator only inside async function bodies.
+        if (self.await_allowed and self.current.type == .identifier and
+            std.mem.eql(u8, self.current.owned_value orelse self.current.lexeme, "await"))
+        {
+            const start = self.current.start;
+            try self.advance();
+            const operand = try self.parseUnary();
+            return self.newNode(start, operand.end, .{ .await_expr = operand });
+        }
         if (unaryOpFor(self.current.type)) |op| {
             const start = self.current.start;
             try self.advance();
@@ -661,6 +700,16 @@ pub const Parser = struct {
                 return self.newNode(tok.start, tok.end, .{ .this_expr = {} });
             },
             .identifier => {
+                // `async function ...` at expression position: hand the
+                // whole thing (async included) to the function hook.
+                if (self.function_hooks) |h| {
+                    if (std.mem.eql(u8, tok.owned_value orelse tok.lexeme, "async") and
+                        try self.peekNextType() == .keyword_function)
+                    {
+                        const result = try h.parseFunctionExpression(h.ctx, self);
+                        return self.newNode(tok.start, result.end, .{ .function_like = result.node });
+                    }
+                }
                 try self.advance();
                 return self.newNode(tok.start, tok.end, .{ .identifier = tok.owned_value orelse tok.lexeme });
             },
