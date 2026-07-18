@@ -9,6 +9,8 @@ pub const LogicalOp = ast_mod.LogicalOp;
 pub const AssignOp = ast_mod.AssignOp;
 pub const ObjectProperty = ast_mod.ObjectProperty;
 pub const ObjectLiteralElement = ast_mod.ObjectLiteralElement;
+pub const PropertyKind = ast_mod.PropertyKind;
+pub const MethodKind = parser_mod.MethodKind;
 
 pub const Parser = parser_mod.Parser;
 pub const ParseError = parser_mod.ParseError;

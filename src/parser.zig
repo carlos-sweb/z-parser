@@ -33,6 +33,11 @@ pub const FunctionHookResult = struct { node: *anyopaque, end: usize };
 /// recursive-descent functions without knowing anything about function
 /// bodies (statement lists) at compile time. Null by default -- every
 /// existing call site's behavior is unchanged when no hooks are installed.
+/// Which object-literal method form a `parseMethod` hook call is for --
+/// the hook validates arity accordingly (getters take no parameters,
+/// setters exactly one).
+pub const MethodKind = enum { method, get, set };
+
 pub const FunctionHooks = struct {
     ctx: *anyopaque,
     /// Called once `parseAssignment` has already confirmed (via its own
@@ -42,6 +47,12 @@ pub const FunctionHooks = struct {
     parseArrowFunction: *const fn (ctx: *anyopaque, parser: *Parser) ParseError!FunctionHookResult,
     /// Called from `parsePrimary` when `parser.current.type == .keyword_function`.
     parseFunctionExpression: *const fn (ctx: *anyopaque, parser: *Parser) ParseError!FunctionHookResult,
+    /// Called from `parseObjectProperty` for `m() {}` / `get x() {}` /
+    /// `set x(v) {}`, with `parser.current` positioned at the `(` of the
+    /// parameter list (the key -- and `get`/`set` -- already consumed).
+    /// `name` is the property key's source text ("" for computed keys),
+    /// for the resulting function's `.name`.
+    parseMethod: *const fn (ctx: *anyopaque, parser: *Parser, kind: MethodKind, name: []const u8) ParseError!FunctionHookResult,
 };
 
 /// `/` is either division or the start of a RegExpLiteral depending on
@@ -110,6 +121,10 @@ pub fn isValidAssignmentPattern(node: *Node) bool {
             for (elements, 0..) |el, i| {
                 switch (el) {
                     .property => |prop| {
+                        // Methods/accessors can never be assignment
+                        // targets (`({ m() {} } = x)` is a real
+                        // SyntaxError).
+                        if (prop.kind != .init) return false;
                         // Shorthand `{a}` -- key and value are the same
                         // identifier node, already a valid target.
                         if (!isValidPatternElement(prop.value, true)) return false;
@@ -718,48 +733,99 @@ pub const Parser = struct {
         return self.newNode(start, end, .{ .object_literal = try elements.toOwnedSlice(self.arena) });
     }
 
-    fn parseObjectProperty(self: *Parser) ParseError!ast.ObjectProperty {
-        var computed = false;
-        var key: *Node = undefined;
+    const ParsedKey = struct { key: *Node, computed: bool, name: []const u8 };
 
+    fn parsePropertyKey(self: *Parser) ParseError!ParsedKey {
         if (self.current.type == .punct_lbracket) {
-            computed = true;
             try self.advance();
-            key = try self.parseAssignment();
+            const key = try self.parseAssignment();
             _ = try self.expect(.punct_rbracket);
-        } else {
-            const tok = self.current;
-            switch (tok.type) {
-                .identifier => {
-                    key = try self.newNode(tok.start, tok.end, .{ .identifier = tok.owned_value orelse tok.lexeme });
+            return .{ .key = key, .computed = true, .name = "" };
+        }
+        const tok = self.current;
+        switch (tok.type) {
+            .identifier => {
+                const text = tok.owned_value orelse tok.lexeme;
+                const key = try self.newNode(tok.start, tok.end, .{ .identifier = text });
+                try self.advance();
+                return .{ .key = key, .computed = false, .name = text };
+            },
+            .string_literal => {
+                const v = tok.owned_value orelse tok.lexeme[1 .. tok.lexeme.len - 1];
+                const key = try self.newNode(tok.start, tok.end, .{ .string_literal = v });
+                try self.advance();
+                return .{ .key = key, .computed = false, .name = v };
+            },
+            .numeric_literal => {
+                const key = try self.newNode(tok.start, tok.end, .{ .number_literal = tok.numeric_value.? });
+                try self.advance();
+                return .{ .key = key, .computed = false, .name = "" };
+            },
+            else => {
+                // Reserved words are valid (unquoted) property keys too, e.g. `{ if: 1 }`.
+                if (zlexer.keywordFromLexeme(tok.lexeme) != null) {
+                    const key = try self.newNode(tok.start, tok.end, .{ .identifier = tok.lexeme });
                     try self.advance();
-                },
-                .string_literal => {
-                    const v = tok.owned_value orelse tok.lexeme[1 .. tok.lexeme.len - 1];
-                    key = try self.newNode(tok.start, tok.end, .{ .string_literal = v });
-                    try self.advance();
-                },
-                .numeric_literal => {
-                    key = try self.newNode(tok.start, tok.end, .{ .number_literal = tok.numeric_value.? });
-                    try self.advance();
-                },
-                else => {
-                    // Reserved words are valid (unquoted) property keys too, e.g. `{ if: 1 }`.
-                    if (zlexer.keywordFromLexeme(tok.lexeme) != null) {
-                        key = try self.newNode(tok.start, tok.end, .{ .identifier = tok.lexeme });
-                        try self.advance();
-                    } else return ParseError.UnexpectedToken;
-                },
+                    return .{ .key = key, .computed = false, .name = tok.lexeme };
+                }
+                return ParseError.UnexpectedToken;
+            },
+        }
+    }
+
+    /// Key (and `get`/`set`) already consumed; `self.current` is the `(`
+    /// of the parameter list. Body parsing needs statement grammar this
+    /// repo doesn't have -- without hooks installed, methods are a plain
+    /// UnexpectedToken.
+    fn finishMethodProperty(self: *Parser, kind: MethodKind, parsed: ParsedKey) ParseError!ast.ObjectProperty {
+        const h = self.function_hooks orelse return ParseError.UnexpectedToken;
+        const start = self.current.start;
+        const result = try h.parseMethod(h.ctx, self, kind, parsed.name);
+        const value = try self.newNode(start, result.end, .{ .function_like = result.node });
+        const pkind: ast.PropertyKind = switch (kind) {
+            .method => .method,
+            .get => .get,
+            .set => .set,
+        };
+        return .{ .key = parsed.key, .value = value, .computed = parsed.computed, .shorthand = false, .kind = pkind };
+    }
+
+    fn parseObjectProperty(self: *Parser) ParseError!ast.ObjectProperty {
+        // Accessor detection: identifier `get`/`set` followed by anything
+        // that is NOT `:`/`,`/`}`/`(` means a real key comes next
+        // (`get x() {}`). The excluded four keep get/set as an ordinary
+        // key: `{get: 1}`, `{get}`, `{get, ...}`, `{get() {}}`.
+        if (self.current.type == .identifier) {
+            const lex = self.current.owned_value orelse self.current.lexeme;
+            const accessor: ?MethodKind = if (std.mem.eql(u8, lex, "get"))
+                .get
+            else if (std.mem.eql(u8, lex, "set"))
+                .set
+            else
+                null;
+            if (accessor) |kind| {
+                switch (try self.peekNextType()) {
+                    .punct_colon, .punct_comma, .punct_rbrace, .punct_lparen => {},
+                    else => {
+                        try self.advance(); // 'get' / 'set'
+                        const parsed = try self.parsePropertyKey();
+                        return self.finishMethodProperty(kind, parsed);
+                    },
+                }
             }
         }
 
-        if (!computed and key.data == .identifier and (self.current.type == .punct_comma or self.current.type == .punct_rbrace)) {
+        const parsed = try self.parsePropertyKey();
+        if (self.current.type == .punct_lparen) {
+            return self.finishMethodProperty(.method, parsed);
+        }
+        if (!parsed.computed and parsed.key.data == .identifier and (self.current.type == .punct_comma or self.current.type == .punct_rbrace)) {
             // Shorthand `{x}` -- value is the same identifier node as the key.
-            return .{ .key = key, .value = key, .computed = false, .shorthand = true };
+            return .{ .key = parsed.key, .value = parsed.key, .computed = false, .shorthand = true, .kind = .init };
         }
         _ = try self.expect(.punct_colon);
         const value = try self.parseAssignment();
-        return .{ .key = key, .value = value, .computed = computed, .shorthand = false };
+        return .{ .key = parsed.key, .value = value, .computed = parsed.computed, .shorthand = false, .kind = .init };
     }
 
     // ===== Template literals =====

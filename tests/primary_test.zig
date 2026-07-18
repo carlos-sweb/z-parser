@@ -80,6 +80,28 @@ test "object literal: key:value, shorthand, computed, spread" {
     }.check);
 }
 
+test "get/set stay ordinary keys in their non-accessor forms" {
+    try helpers.parseAndCheck("({get: 1, set: 2})", {}, struct {
+        fn check(_: void, node: *zparser.Node) !void {
+            const els = node.data.paren.data.object_literal;
+            try testing.expect(els[0].property.kind == .init);
+            try testing.expect(els[1].property.kind == .init);
+        }
+    }.check);
+    try helpers.parseAndCheck("({get, set})", {}, struct {
+        fn check(_: void, node: *zparser.Node) !void {
+            const els = node.data.paren.data.object_literal;
+            try testing.expect(els[0].property.shorthand);
+            try testing.expect(els[1].property.shorthand);
+        }
+    }.check);
+}
+
+test "methods/accessors without hooks installed are UnexpectedToken (bodies need z-functions)" {
+    try helpers.expectParseError("({m() {}})", zparser.ParseError.UnexpectedToken);
+    try helpers.expectParseError("({get x() {}})", zparser.ParseError.UnexpectedToken);
+}
+
 test "object literal allows reserved words as keys" {
     try helpers.parseAndCheck("({if: 1, class: 2})", {}, struct {
         fn check(_: void, node: *zparser.Node) !void {

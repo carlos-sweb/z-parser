@@ -54,11 +54,17 @@ pub const AssignOp = enum {
     nullish,
 };
 
+/// `.init` = ordinary `key: value` / shorthand; `.method` = `m() {}`;
+/// `.get`/`.set` = accessor clauses. For the last three, `value` is the
+/// opaque `.function_like` node produced by the parseMethod hook.
+pub const PropertyKind = enum { init, method, get, set };
+
 pub const ObjectProperty = struct {
     key: *Node,
     value: *Node,
     computed: bool,
     shorthand: bool,
+    kind: PropertyKind,
 };
 
 pub const ObjectLiteralElement = union(enum) {
