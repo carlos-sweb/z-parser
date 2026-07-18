@@ -120,4 +120,12 @@ pub const NodeData = union(enum) {
     /// z-functions -- this repo never dereferences it. See z-functions'
     /// `asFunctionNode()`.
     function_like: *anyopaque,
+    /// A class expression node, typed and owned solely by z-functions --
+    /// this repo never dereferences it. See z-functions' `asClassNode()`.
+    class_like: *anyopaque,
+    /// The `super` keyword in expression position. Only meaningful as a
+    /// call callee (`super(...)`) or member object (`super.m`) inside
+    /// class bodies -- both shapes fall out of the ordinary call/member
+    /// machinery; the interpreter validates placement at runtime.
+    super_expr: void,
 };

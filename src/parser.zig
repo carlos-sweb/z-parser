@@ -53,6 +53,8 @@ pub const FunctionHooks = struct {
     /// `name` is the property key's source text ("" for computed keys),
     /// for the resulting function's `.name`.
     parseMethod: *const fn (ctx: *anyopaque, parser: *Parser, kind: MethodKind, name: []const u8) ParseError!FunctionHookResult,
+    /// Called from `parsePrimary` when `parser.current.type == .keyword_class`.
+    parseClassExpression: *const fn (ctx: *anyopaque, parser: *Parser) ParseError!FunctionHookResult,
 };
 
 /// `/` is either division or the start of a RegExpLiteral depending on
@@ -681,6 +683,14 @@ pub const Parser = struct {
                 const result = try h.parseFunctionExpression(h.ctx, self);
                 return self.newNode(tok.start, result.end, .{ .function_like = result.node });
             } else return ParseError.UnexpectedToken,
+            .keyword_class => if (self.function_hooks) |h| {
+                const result = try h.parseClassExpression(h.ctx, self);
+                return self.newNode(tok.start, result.end, .{ .class_like = result.node });
+            } else return ParseError.UnexpectedToken,
+            .keyword_super => {
+                try self.advance();
+                return self.newNode(tok.start, tok.end, .{ .super_expr = {} });
+            },
             else => return ParseError.UnexpectedToken,
         }
     }

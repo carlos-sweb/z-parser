@@ -30,7 +30,8 @@ No dependency on [z-value](https://github.com/carlos-sweb/z-value): the AST hold
 
 - **Object literal method/getter/setter shorthand** (`{ m() {}, get x() {}, set x(v) {} }`): parsed here via the `parseMethod` function hook (bodies come from z-functions), with `ObjectProperty.kind: init | method | get | set`. `get`/`set` detection is one token of lookahead: an identifier `get`/`set` NOT followed by `:`/`,`/`}`/`(` starts an accessor clause, so `{get: 1}`, `{get}`, and `{get() {}}` all keep their ordinary meanings. Without hooks installed, methods are a plain `UnexpectedToken` — standalone z-parser has no body grammar. CoverInitializedName (`({a = 1} = {})`) still doesn't parse — `{a: a = 1}` is the equivalent that works.
 - **CoverInitializedName** (`({a = 1} = {})` — shorthand-with-default in an object *assignment* pattern): `{a = 1}` only exists in the real spec's cover grammar and doesn't parse as an object literal here; `{a: a = 1}` is the equivalent that works. (Destructuring in binding positions — declarators/params/catch — lives in z-statements/z-functions, not here.)
-- **Classes, `super`, generators, `async`/`await`, modules** (`import`/`export`).
+- **Classes and `super` are hook-delegated, like functions**: `class` at expression position calls the `parseClassExpression` hook (opaque `.class_like` node owned by z-functions); `super` parses as a `.super_expr` primary whose `super.m()` / `super(...)` shapes fall out of the ordinary member/call machinery, with placement validated at runtime by the interpreter.
+- **Generators, `async`/`await`, modules** (`import`/`export`).
 - Template literals expose only the cooked value (`TV`), not the raw value (`TRV`) tagged templates need for `.raw` — not needed until tagged templates exist at the parser/interpreter level.
 
 ## Usage
