@@ -48,11 +48,11 @@ pub const FunctionHooks = struct {
     /// Called from `parsePrimary` when `parser.current.type == .keyword_function`.
     parseFunctionExpression: *const fn (ctx: *anyopaque, parser: *Parser) ParseError!FunctionHookResult,
     /// Called from `parseObjectProperty` for `m() {}` / `get x() {}` /
-    /// `set x(v) {}`, with `parser.current` positioned at the `(` of the
-    /// parameter list (the key -- and `get`/`set` -- already consumed).
-    /// `name` is the property key's source text ("" for computed keys),
-    /// for the resulting function's `.name`.
-    parseMethod: *const fn (ctx: *anyopaque, parser: *Parser, kind: MethodKind, name: []const u8) ParseError!FunctionHookResult,
+    /// `set x(v) {}` / `*m() {}` / `async m() {}`, with `parser.current`
+    /// positioned at the `(` of the parameter list (the key -- and
+    /// `get`/`set`/`async`/`*` -- already consumed). `name` is the
+    /// property key's source text ("" for computed keys).
+    parseMethod: *const fn (ctx: *anyopaque, parser: *Parser, kind: MethodKind, name: []const u8, is_generator: bool, is_async: bool) ParseError!FunctionHookResult,
     /// Called from `parsePrimary` when `parser.current.type == .keyword_class`.
     parseClassExpression: *const fn (ctx: *anyopaque, parser: *Parser) ParseError!FunctionHookResult,
 };
@@ -344,6 +344,31 @@ pub const Parser = struct {
         return self.current.type == .punct_arrow;
     }
 
+    /// Current token is the contextual `async`. Confirms it heads an
+    /// async arrow: the next token (same line -- no ASI break) begins an
+    /// arrow head, either `ident =>` or `( ... ) =>`.
+    fn scanConfirmsAsyncArrow(self: *Parser) ParseError!bool {
+        const saved_pos = self.lexer.pos;
+        const saved_line = self.lexer.line;
+        const saved_column = self.lexer.column;
+        const saved_current = self.current;
+        defer {
+            self.lexer.pos = saved_pos;
+            self.lexer.line = saved_line;
+            self.lexer.column = saved_column;
+            self.current = saved_current;
+        }
+        try self.advance(); // past `async`
+        if (self.current.had_line_terminator_before) return false; // `async\n x =>` is not an async arrow
+        if (self.current.type == .identifier) {
+            return (try self.peekNextType()) == .punct_arrow;
+        }
+        if (self.current.type == .punct_lparen) {
+            return self.scanConfirmsArrow();
+        }
+        return false;
+    }
+
     fn newNode(self: *Parser, start: usize, end: usize, data: NodeData) ParseError!*Node {
         const node = try self.arena.create(Node);
         node.* = .{ .start = start, .end = end, .data = data };
@@ -385,6 +410,13 @@ pub const Parser = struct {
             const start = self.current.start;
             var end = self.current.end;
             try self.advance();
+            // `yield* expr` delegates -- the `*` binds to yield before the
+            // restricted-production check, and the argument is mandatory.
+            if (self.current.type == .punct_star) {
+                try self.advance();
+                const a = try self.parseAssignment();
+                return self.newNode(start, a.end, .{ .yield_expr = .{ .argument = a, .delegate = true } });
+            }
             var argument: ?*Node = null;
             // Argument-less yield: a terminator follows, or ASI's
             // restricted-production rule (newline right after `yield`).
@@ -406,6 +438,18 @@ pub const Parser = struct {
                 return self.newNode(start, result.end, .{ .function_like = result.node });
             }
             if (self.current.type == .punct_lparen and try self.scanConfirmsArrow()) {
+                const start = self.current.start;
+                const result = try h.parseArrowFunction(h.ctx, self);
+                return self.newNode(start, result.end, .{ .function_like = result.node });
+            }
+            // Async arrows: `async x => ...` / `async (...) => ...`. The
+            // hook consumes the leading `async` itself. (`async` NOT
+            // followed on the same line by an arrow-shaped head stays an
+            // ordinary identifier.)
+            if (self.current.type == .identifier and
+                std.mem.eql(u8, self.current.owned_value orelse self.current.lexeme, "async") and
+                try self.scanConfirmsAsyncArrow())
+            {
                 const start = self.current.start;
                 const result = try h.parseArrowFunction(h.ctx, self);
                 return self.newNode(start, result.end, .{ .function_like = result.node });
@@ -836,10 +880,10 @@ pub const Parser = struct {
     /// of the parameter list. Body parsing needs statement grammar this
     /// repo doesn't have -- without hooks installed, methods are a plain
     /// UnexpectedToken.
-    fn finishMethodProperty(self: *Parser, kind: MethodKind, parsed: ParsedKey) ParseError!ast.ObjectProperty {
+    fn finishMethodProperty(self: *Parser, kind: MethodKind, parsed: ParsedKey, is_generator: bool, is_async: bool) ParseError!ast.ObjectProperty {
         const h = self.function_hooks orelse return ParseError.UnexpectedToken;
         const start = self.current.start;
-        const result = try h.parseMethod(h.ctx, self, kind, parsed.name);
+        const result = try h.parseMethod(h.ctx, self, kind, parsed.name, is_generator, is_async);
         const value = try self.newNode(start, result.end, .{ .function_like = result.node });
         const pkind: ast.PropertyKind = switch (kind) {
             .method => .method,
@@ -849,10 +893,46 @@ pub const Parser = struct {
         return .{ .key = parsed.key, .value = value, .computed = parsed.computed, .shorthand = false, .kind = pkind };
     }
 
+    /// True when the contextual identifier `async`/`get`/`set` at the
+    /// current position actually prefixes a method (a real key follows),
+    /// vs. being an ordinary key itself (`{ async: 1 }`, `{ get }`).
+    fn contextualPrefixIsMethod(self: *Parser) ParseError!bool {
+        return switch (try self.peekNextType()) {
+            .punct_colon, .punct_comma, .punct_rbrace, .punct_lparen, .punct_assign => false,
+            else => true,
+        };
+    }
+
     fn parseObjectProperty(self: *Parser) ParseError!ast.ObjectProperty {
+        var is_generator = false;
+        var is_async = false;
+
+        // `async` method prefix (contextual): `{ async m() {} }`,
+        // `{ async *g() {} }`. Not a prefix in `{ async: 1 }` / `{ async }`.
+        // (A line terminator BEFORE `async` is fine -- a property can
+        // start on a new line; the restricted `async [no LT] name` rule
+        // is a narrowing we don't enforce.)
+        if (self.current.type == .identifier and
+            std.mem.eql(u8, self.current.owned_value orelse self.current.lexeme, "async"))
+        {
+            if (try self.contextualPrefixIsMethod()) {
+                is_async = true;
+                try self.advance();
+            }
+        }
+        // `*` generator prefix: `{ *g() {} }`, `{ async *g() {} }`.
+        if (self.current.type == .punct_star) {
+            is_generator = true;
+            try self.advance();
+        }
+        if (is_generator or is_async) {
+            const parsed = try self.parsePropertyKey();
+            return self.finishMethodProperty(.method, parsed, is_generator, is_async);
+        }
+
         // Accessor detection: identifier `get`/`set` followed by anything
-        // that is NOT `:`/`,`/`}`/`(` means a real key comes next
-        // (`get x() {}`). The excluded four keep get/set as an ordinary
+        // that is NOT `:`/`,`/`}`/`(`/`=` means a real key comes next
+        // (`get x() {}`). The excluded cases keep get/set as an ordinary
         // key: `{get: 1}`, `{get}`, `{get, ...}`, `{get() {}}`.
         if (self.current.type == .identifier) {
             const lex = self.current.owned_value orelse self.current.lexeme;
@@ -863,20 +943,17 @@ pub const Parser = struct {
             else
                 null;
             if (accessor) |kind| {
-                switch (try self.peekNextType()) {
-                    .punct_colon, .punct_comma, .punct_rbrace, .punct_lparen => {},
-                    else => {
-                        try self.advance(); // 'get' / 'set'
-                        const parsed = try self.parsePropertyKey();
-                        return self.finishMethodProperty(kind, parsed);
-                    },
+                if (try self.contextualPrefixIsMethod()) {
+                    try self.advance(); // 'get' / 'set'
+                    const parsed = try self.parsePropertyKey();
+                    return self.finishMethodProperty(kind, parsed, false, false);
                 }
             }
         }
 
         const parsed = try self.parsePropertyKey();
         if (self.current.type == .punct_lparen) {
-            return self.finishMethodProperty(.method, parsed);
+            return self.finishMethodProperty(.method, parsed, false, false);
         }
         if (!parsed.computed and parsed.key.data == .identifier and (self.current.type == .punct_comma or self.current.type == .punct_rbrace)) {
             // Shorthand `{x}` -- value is the same identifier node as the key.
