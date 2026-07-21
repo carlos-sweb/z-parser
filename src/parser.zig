@@ -630,6 +630,15 @@ pub const Parser = struct {
 
     fn parsePropertyNameAfterDot(self: *Parser) ParseError!*Node {
         const tok = self.current;
+        // A `#name` private member access (`this.#x`, `obj?.#y`). The
+        // identifier node keeps the leading '#' -- ordinary identifiers can
+        // never contain one, so a non-computed member whose name starts
+        // with '#' unambiguously means private access downstream.
+        if (tok.type == .private_identifier) {
+            const name = tok.owned_value orelse tok.lexeme;
+            try self.advance();
+            return self.newNode(tok.start, tok.end, .{ .identifier = name });
+        }
         // IdentifierName: any identifier OR reserved keyword is valid after
         // `.`/`?.` (e.g. `obj.if`, `obj.class`).
         if (tok.type != .identifier and zlexer.keywordFromLexeme(tok.lexeme) == null) {
@@ -717,6 +726,14 @@ pub const Parser = struct {
             .numeric_literal => {
                 try self.advance();
                 return self.newNode(tok.start, tok.end, .{ .number_literal = tok.numeric_value.? });
+            },
+            .private_identifier => {
+                // `#x in obj` (private brand check) -- the only place the
+                // real grammar allows a bare private name in an expression.
+                // Parsed permissively as a '#'-prefixed identifier node;
+                // the evaluator restricts it to the `in` form (narrowed).
+                try self.advance();
+                return self.newNode(tok.start, tok.end, .{ .identifier = tok.owned_value orelse tok.lexeme });
             },
             .bigint_literal => {
                 try self.advance();
