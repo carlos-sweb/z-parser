@@ -19,6 +19,11 @@ pub const ParseError = error{
     /// `-a ** b` without parens -- the left operand of `**` may not be an
     /// un-parenthesized unary expression (`(-a) ** b` is fine).
     InvalidExponentiationOperand,
+    /// Native-stack-depth guard tripped (see `Parser.stack_limit`) --
+    /// adversarial input with unbounded nesting (deeply nested parens,
+    /// `new`-chains, prefix-operator chains) would otherwise segfault the
+    /// whole process instead of failing as a catchable parse error.
+    MaxNestingDepthExceeded,
 } || zlexer.LexError;
 
 const ArgList = struct { args: []const *Node, end: usize };
@@ -260,6 +265,15 @@ pub const Parser = struct {
     /// Same contract for `await` inside async function bodies. Off, the
     /// contextual `await` stays an ordinary identifier.
     await_allowed: bool = false,
+    /// Byte-based native-stack-overflow guard, `@frameAddress()`-based --
+    /// same idiom as z-interpreter's `evalExpression` stack guard (see
+    /// `/home/sweb/.plans/z-parser-improve.md`). `0` (the default)
+    /// disables the check entirely -- standalone/test usage doesn't need
+    /// it. Deliberately NOT self-computed by `init`: when this parser runs
+    /// nested inside an already-recursed caller (e.g. `eval()` called from
+    /// deep inside a running script), only the caller knows how much real
+    /// stack is left, so the caller must compute and pass this in.
+    stack_limit: usize = 0,
 
     pub fn init(arena: Allocator, source: []const u8) ParseError!Parser {
         var self: Parser = .{
@@ -269,6 +283,16 @@ pub const Parser = struct {
         };
         self.current = try self.lexer.nextToken(.regex_allowed);
         return self;
+    }
+
+    /// Checked at every genuinely self-recursive entry point
+    /// (`parseAssignment`, `parseUnary`, `parseMemberExpressionImpl`) --
+    /// NOT at every precedence-level function, since those loop rather
+    /// than recurse unboundedly on their own.
+    fn checkStackDepth(self: *Parser) ParseError!void {
+        if (self.stack_limit != 0 and @frameAddress() < self.stack_limit) {
+            return ParseError.MaxNestingDepthExceeded;
+        }
     }
 
     pub fn advance(self: *Parser) ParseError!void {
@@ -295,17 +319,13 @@ pub const Parser = struct {
     }
 
     /// Peeks the type of the token *after* `self.current` without consuming
-    /// it, via the lexer-position rewind idiom (save `lexer.{pos,line,column}`
-    /// + `current`, advance once, read, restore everything).
+    /// it, via the lexer-position rewind idiom (checkpoint the lexer +
+    /// `current`, advance once, read, restore everything).
     pub fn peekNextType(self: *Parser) ParseError!TokenType {
-        const saved_pos = self.lexer.pos;
-        const saved_line = self.lexer.line;
-        const saved_column = self.lexer.column;
+        const saved_lexer = self.lexer.checkpoint();
         const saved_current = self.current;
         defer {
-            self.lexer.pos = saved_pos;
-            self.lexer.line = saved_line;
-            self.lexer.column = saved_column;
+            self.lexer.restore(saved_lexer);
             self.current = saved_current;
         }
         try self.advance();
@@ -320,14 +340,10 @@ pub const Parser = struct {
     /// `FunctionHooks.parseArrowFunction` call starting fresh from the
     /// original `(`.
     fn scanConfirmsArrow(self: *Parser) ParseError!bool {
-        const saved_pos = self.lexer.pos;
-        const saved_line = self.lexer.line;
-        const saved_column = self.lexer.column;
+        const saved_lexer = self.lexer.checkpoint();
         const saved_current = self.current;
         defer {
-            self.lexer.pos = saved_pos;
-            self.lexer.line = saved_line;
-            self.lexer.column = saved_column;
+            self.lexer.restore(saved_lexer);
             self.current = saved_current;
         }
         var depth: i32 = 1;
@@ -348,14 +364,10 @@ pub const Parser = struct {
     /// async arrow: the next token (same line -- no ASI break) begins an
     /// arrow head, either `ident =>` or `( ... ) =>`.
     fn scanConfirmsAsyncArrow(self: *Parser) ParseError!bool {
-        const saved_pos = self.lexer.pos;
-        const saved_line = self.lexer.line;
-        const saved_column = self.lexer.column;
+        const saved_lexer = self.lexer.checkpoint();
         const saved_current = self.current;
         defer {
-            self.lexer.pos = saved_pos;
-            self.lexer.line = saved_line;
-            self.lexer.column = saved_column;
+            self.lexer.restore(saved_lexer);
             self.current = saved_current;
         }
         try self.advance(); // past `async`
@@ -402,6 +414,7 @@ pub const Parser = struct {
     }
 
     fn parseAssignment(self: *Parser) ParseError!*Node {
+        try self.checkStackDepth();
         // YieldExpression sits at AssignmentExpression level in the real
         // grammar. Outside generator bodies `yield` is simply reserved
         // (consistent with the engine's always-strict stance).
@@ -568,6 +581,7 @@ pub const Parser = struct {
     // ===== Unary / postfix =====
 
     fn parseUnary(self: *Parser) ParseError!*Node {
+        try self.checkStackDepth();
         // `await` is a contextual identifier that becomes a unary-level
         // operator only inside async function bodies.
         if (self.await_allowed and self.current.type == .identifier and
@@ -693,6 +707,7 @@ pub const Parser = struct {
     }
 
     fn parseMemberExpressionImpl(self: *Parser, comptime allow_calls: bool) ParseError!*Node {
+        try self.checkStackDepth();
         var base: *Node = undefined;
         if (self.current.type == .keyword_new) {
             const start = self.current.start;

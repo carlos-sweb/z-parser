@@ -21,6 +21,7 @@ pub fn build(b: *std.Build) void {
         "tests/assignment_test.zig",
         "tests/template_test.zig",
         "tests/regex_division_test.zig",
+        "tests/stack_depth_test.zig",
     };
 
     inline for (test_files) |test_file| {
