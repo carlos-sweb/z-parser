@@ -1,7 +1,7 @@
 .{
     .name = .zparser,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .fingerprint = 0x4b0432cba6697fb9,
     .description = "ECMAScript expression parser (ECMA-262 section 13) in Zig",
     .paths = .{
@@ -11,6 +11,9 @@
         "README.md",
     },
     .dependencies = .{
-        .zlexer = .{ .path = "../z-lexer" },
+        .zlexer = .{
+            .url = "git+https://github.com/carlos-sweb/z-lexer#69ff690c84a61afe41ca2f18693148ab91ce0e04",
+            .hash = "zlexer-0.1.0-MGWO99X7AADDOpmUcxiMwNSro004LoubEkpxiTc3Y5NS",
+        },
     },
 }

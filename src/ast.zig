@@ -1,13 +1,17 @@
 const std = @import("std");
 
+/// Arena-owned expression with byte offsets into the original source.
+/// `start` is inclusive and `end` is exclusive.
 pub const Node = struct {
     start: usize,
     end: usize,
     data: NodeData,
 };
 
+/// Unary operators, including prefix and postfix updates.
 pub const UnaryOp = enum { not, bitnot, plus, minus, typeof, void_op, delete, pre_inc, pre_dec, post_inc, post_dec };
 
+/// Arithmetic, bitwise, equality and relational operators.
 pub const BinaryOp = enum {
     add,
     sub,
@@ -33,8 +37,10 @@ pub const BinaryOp = enum {
     in,
 };
 
+/// Short-circuit logical and nullish-coalescing operators.
 pub const LogicalOp = enum { and_op, or_op, nullish };
 
+/// Plain and compound assignment operators.
 pub const AssignOp = enum {
     assign,
     add,
@@ -59,6 +65,7 @@ pub const AssignOp = enum {
 /// opaque `.function_like` node produced by the parseMethod hook.
 pub const PropertyKind = enum { init, method, get, set };
 
+/// Object property, including shorthand, computed keys and hook-owned methods.
 pub const ObjectProperty = struct {
     key: *Node,
     value: *Node,
@@ -67,12 +74,14 @@ pub const ObjectProperty = struct {
     kind: PropertyKind,
 };
 
+/// Property or spread entry in an object literal.
 pub const ObjectLiteralElement = union(enum) {
     property: ObjectProperty,
     /// `...expr` inside an object literal.
     spread: *Node,
 };
 
+/// Expression payload. Child nodes and slices share the parser's arena lifetime.
 pub const NodeData = union(enum) {
     number_literal: f64,
     /// Raw digit text (no evaluated value -- there's no BigInt runtime type

@@ -9,8 +9,22 @@ pub fn build(b: *std.Build) void {
 
     const zparser_module = b.addModule("zparser", .{
         .root_source_file = b.path("src/zparser.zig"),
+        .target = target,
+        .optimize = optimize,
     });
     zparser_module.addImport("zlexer", zlexer_module);
+
+    const docs_library = b.addLibrary(.{
+        .name = "zparser",
+        .root_module = zparser_module,
+    });
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = docs_library.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    const docs_step = b.step("docs", "Generate API documentation in zig-out/docs");
+    docs_step.dependOn(&install_docs.step);
 
     const test_step = b.step("test", "Run all tests");
 

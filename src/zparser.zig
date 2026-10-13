@@ -1,3 +1,17 @@
+//! ECMAScript expression parser (ECMA-262 section 13).
+//!
+//! Create a `Parser` with an arena allocator and a borrowed source string,
+//! then call `Parser.parseExpression` to obtain an arena-owned `Node` tree.
+//! Keep the source and arena alive while using the parser or AST; releasing
+//! the arena frees the entire parse result. Parsing consumes one expression
+//! and leaves `Parser.current` at the following token, allowing statement
+//! parsers to share the same stream.
+//!
+//! `NodeData` describes expression variants. `FunctionHooks` lets consumers
+//! provide function and class grammar without adding statement dependencies.
+//! Fallible parser operations return `ParseError`, including lexer errors
+//! and allocator failure.
+
 const ast_mod = @import("ast.zig");
 const parser_mod = @import("parser.zig");
 

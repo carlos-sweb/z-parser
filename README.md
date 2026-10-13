@@ -1,9 +1,9 @@
 # Z-Parser
 
-[![Zig Version](https://img.shields.io/badge/zig-0.16-orange.svg)](https://ziglang.org/)
+[![Zig Version](https://img.shields.io/badge/zig-0.17.0-orange.svg)](https://ziglang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-ECMAScript **expression parser** (ECMA-262 §13) in Zig 0.16 — the second repo of the JS engine, consuming [z-lexer](https://github.com/carlos-sweb/z-lexer)'s token stream. Part of the [z-*](https://github.com/carlos-sweb) micro-library family.
+ECMAScript **expression parser** (ECMA-262 §13) in Zig 0.17.0 — the second repo of the JS engine, consuming [z-lexer](https://github.com/carlos-sweb/z-lexer)'s token stream. Part of the [z-*](https://github.com/carlos-sweb) micro-library family.
 
 ## Scope: expressions only
 
@@ -50,9 +50,26 @@ const ast = try parser.parseExpression();
 
 ## Testing
 
+Requires Zig 0.17.0 (see `mise.toml`). `zig build` downloads the pinned
+`z-lexer` dependency and its transitive dependencies; no sibling checkout is needed.
+
 ```bash
 zig build test
 ```
+
+## API documentation
+
+[Browse the generated API reference](https://carlos-sweb.github.io/z-parser/).
+The reference is generated from the public Zig declarations and doc comments.
+
+```bash
+zig build docs
+python3 -m http.server 8000 --directory zig-out/docs
+```
+
+Open `http://localhost:8000/` to browse the API locally. GitHub Actions runs
+the tests and publishes `zig-out/docs` to GitHub Pages on each push to `master`.
+The workflow can also be run manually.
 
 ## License
 

@@ -9,6 +9,7 @@ const ast = @import("ast.zig");
 const Node = ast.Node;
 const NodeData = ast.NodeData;
 
+/// Syntax and nesting errors, combined with lexer errors and allocator failure.
 pub const ParseError = error{
     UnexpectedToken,
     UnexpectedEnd,
@@ -33,16 +34,14 @@ const ArgList = struct { args: []const *Node, end: usize };
 /// opaque node itself without dereferencing it, which it must never do).
 pub const FunctionHookResult = struct { node: *anyopaque, end: usize };
 
-/// Hooks a dependent repo (z-functions) installs so this parser can produce
-/// function/arrow-function expression nodes from inside its own private
-/// recursive-descent functions without knowing anything about function
-/// bodies (statement lists) at compile time. Null by default -- every
-/// existing call site's behavior is unchanged when no hooks are installed.
 /// Which object-literal method form a `parseMethod` hook call is for --
 /// the hook validates arity accordingly (getters take no parameters,
 /// setters exactly one).
 pub const MethodKind = enum { method, get, set };
 
+/// Hooks a dependent repo (z-functions) installs so this parser can produce
+/// function and class expressions without depending on statement grammar.
+/// `Parser.function_hooks` defaults to null; hook-owned nodes share the arena.
 pub const FunctionHooks = struct {
     ctx: *anyopaque,
     /// Called once `parseAssignment` has already confirmed (via its own
@@ -253,6 +252,7 @@ fn bitorOp(t: TokenType) ?ast.BinaryOp {
     return if (t == .punct_pipe) .bitor else null;
 }
 
+/// Recursive-descent parser over a shared lexer stream and arena-owned AST.
 pub const Parser = struct {
     lexer: Lexer,
     arena: Allocator,
@@ -275,6 +275,9 @@ pub const Parser = struct {
     /// stack is left, so the caller must compute and pass this in.
     stack_limit: usize = 0,
 
+    /// Borrows `source`, uses `arena` for tokens and AST nodes, and reads the
+    /// first token. Both must remain alive while the parse result is used.
+    /// Returns lexer errors or allocator failure if tokenization fails.
     pub fn init(arena: Allocator, source: []const u8) ParseError!Parser {
         var self: Parser = .{
             .lexer = Lexer.init(arena, source),
@@ -295,6 +298,8 @@ pub const Parser = struct {
         }
     }
 
+    /// Reads the next token, inferring regex versus division from `current`.
+    /// Returns lexer errors or allocator failure.
     pub fn advance(self: *Parser) ParseError!void {
         const ctx: LexContext = if (regexAllowedAfter(self.current.type)) .regex_allowed else .div_allowed;
         try self.advanceWithContext(ctx);
@@ -311,6 +316,8 @@ pub const Parser = struct {
         self.current = try self.lexer.nextToken(ctx);
     }
 
+    /// Consumes and returns `current` when its type matches `t`, otherwise
+    /// returns `UnexpectedToken`. Advancing can also return lexer errors.
     pub fn expect(self: *Parser, t: TokenType) ParseError!Token {
         if (self.current.type != t) return ParseError.UnexpectedToken;
         const tok = self.current;
@@ -389,7 +396,10 @@ pub const Parser = struct {
 
     // ===== Entry point =====
 
-    /// Full Expression production (comma operator included).
+    /// Parses the full Expression production (comma operator included).
+    /// Returns an arena-owned tree, leaving `current` at the next token.
+    /// Does not require end-of-input. Returns syntax, lexer, allocation or
+    /// nesting-depth errors from `ParseError`.
     pub fn parseExpression(self: *Parser) ParseError!*Node {
         const first = try self.parseAssignment();
         if (self.current.type != .punct_comma) return first;
@@ -409,6 +419,7 @@ pub const Parser = struct {
     /// operator) -- needed by grammar positions that are spec'd one level
     /// below full `Expression`, e.g. a variable declarator's initializer or
     /// a `for-of` loop's iterable clause.
+    /// Returns an arena-owned tree or syntax, lexer, allocation or nesting errors.
     pub fn parseAssignmentExpression(self: *Parser) ParseError!*Node {
         return self.parseAssignment();
     }
