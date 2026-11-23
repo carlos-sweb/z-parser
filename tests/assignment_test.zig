@@ -90,6 +90,26 @@ test "invalid destructuring assignment patterns are rejected like real SyntaxErr
     try helpers.expectParseError("({...r, a} = x)", zparser.ParseError.InvalidAssignmentTarget);
 }
 
+test "CoverInitializedName: valid in destructuring assignment, rejected as plain object literal" {
+    try helpers.parseAndCheck("{ x = 1 } = obj", {}, struct {
+        fn check(_: void, node: *zparser.Node) !void {
+            try testing.expect(node.data == .assignment);
+            const prop = node.data.assignment.target.data.object_literal[0].property;
+            try testing.expect(prop.shorthand);
+            try testing.expect(prop.value.data == .assignment);
+            try testing.expectEqualStrings("x", prop.value.data.assignment.target.data.identifier);
+        }
+    }.check);
+    try helpers.parseAndCheck("{ a, b = 2 } = obj", {}, struct {
+        fn check(_: void, node: *zparser.Node) !void {
+            try testing.expectEqual(@as(usize, 2), node.data.assignment.target.data.object_literal.len);
+        }
+    }.check);
+    try helpers.expectParseError("{ x = 1 }", zparser.ParseError.UnexpectedToken);
+    try helpers.expectParseError("({ x = 1 })", zparser.ParseError.UnexpectedToken);
+    try helpers.expectParseError("{ x = 1 : 2 } = obj", zparser.ParseError.UnexpectedToken);
+}
+
 test "ternary conditional, right-associative nesting" {
     try helpers.parseAndCheck("a ? b : c ? d : e", {}, struct {
         fn check(_: void, node: *zparser.Node) !void {

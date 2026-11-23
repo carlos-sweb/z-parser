@@ -129,3 +129,18 @@ test "sequence inside parens: (1, 2)" {
         }
     }.check);
 }
+
+test "BigInt literal property keys in object literals" {
+    try helpers.parseAndCheck("({ 1n: 'x', 0x10n: 'y', 0b10n: 'z', 0o10n: 'w', 999999999999999999n: true })", {}, struct {
+        fn check(_: void, node: *zparser.Node) !void {
+            const props = node.data.paren.data.object_literal;
+            try testing.expectEqual(@as(usize, 5), props.len);
+            try testing.expectEqualStrings("1", props[0].property.key.data.string_literal);
+            try testing.expectEqualStrings("16", props[1].property.key.data.string_literal);
+            try testing.expectEqualStrings("2", props[2].property.key.data.string_literal);
+            try testing.expectEqualStrings("8", props[3].property.key.data.string_literal);
+            try testing.expectEqualStrings("999999999999999999", props[4].property.key.data.string_literal);
+        }
+    }.check);
+    try helpers.expectParseError("({ 1n })", zparser.ParseError.UnexpectedToken);
+}

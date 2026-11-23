@@ -252,6 +252,86 @@ fn bitorOp(t: TokenType) ?ast.BinaryOp {
     return if (t == .punct_pipe) .bitor else null;
 }
 
+fn containsCoverInitName(node: *const Node) bool {
+    return switch (node.data) {
+        .object_literal => |elements| blk: {
+            for (elements) |el| switch (el) {
+                .property => |prop| {
+                    if (prop.shorthand and prop.value.data == .assignment) break :blk true;
+                    if (prop.computed and containsCoverInitName(prop.key)) break :blk true;
+                    if (containsCoverInitName(prop.value)) break :blk true;
+                },
+                .spread => |sp| if (containsCoverInitName(sp.data.spread)) break :blk true,
+            };
+            break :blk false;
+        },
+        .array_literal => |elements| blk: {
+            for (elements) |maybe_el| if (maybe_el) |el| {
+                if (el.data == .spread) {
+                    if (containsCoverInitName(el.data.spread)) break :blk true;
+                } else if (containsCoverInitName(el)) break :blk true;
+            };
+            break :blk false;
+        },
+        .paren => |inner| containsCoverInitName(inner),
+        .spread, .await_expr => |op| containsCoverInitName(op),
+        .unary => |u| containsCoverInitName(u.operand),
+        .binary => |b| containsCoverInitName(b.left) or containsCoverInitName(b.right),
+        .logical => |l| containsCoverInitName(l.left) or containsCoverInitName(l.right),
+        .conditional => |c| containsCoverInitName(c.test_expr) or containsCoverInitName(c.consequent) or containsCoverInitName(c.alternate),
+        .sequence => |items| blk: {
+            for (items) |it| if (containsCoverInitName(it)) break :blk true;
+            break :blk false;
+        },
+        .assignment => |a| containsCoverInitName(a.value),
+        .member => |m| containsCoverInitName(m.object) or (m.computed and containsCoverInitName(m.property)),
+        .call => |c| blk: {
+            if (containsCoverInitName(c.callee)) break :blk true;
+            for (c.args) |a| if (containsCoverInitName(a)) break :blk true;
+            break :blk false;
+        },
+        .new_expr => |n| blk: {
+            if (containsCoverInitName(n.callee)) break :blk true;
+            if (n.args) |args| for (args) |a| if (containsCoverInitName(a)) break :blk true;
+            break :blk false;
+        },
+        .template_literal => |t| blk: {
+            for (t.expressions) |e| if (containsCoverInitName(e)) break :blk true;
+            break :blk false;
+        },
+        .yield_expr => |y| if (y.argument) |a| containsCoverInitName(a) else false,
+        else => false,
+    };
+}
+
+fn formatBigIntKey(arena: Allocator, raw: []const u8) ParseError![]const u8 {
+    var s = raw;
+    if (s.len > 0 and (s[s.len - 1] == 'n' or s[s.len - 1] == 'N')) {
+        s = s[0 .. s.len - 1];
+    }
+    var radix: u8 = 10;
+    if (s.len >= 2 and s[0] == '0') {
+        if (s[1] == 'x' or s[1] == 'X') {
+            radix = 16;
+            s = s[2..];
+        } else if (s[1] == 'b' or s[1] == 'B') {
+            radix = 2;
+            s = s[2..];
+        } else if (s[1] == 'o' or s[1] == 'O') {
+            radix = 8;
+            s = s[2..];
+        }
+    }
+    var clean: std.ArrayList(u8) = .empty;
+    for (s) |ch| {
+        if (ch != '_') clean.append(arena, ch) catch return ParseError.OutOfMemory;
+    }
+    if (clean.items.len == 0) return ParseError.UnexpectedToken;
+    var bi = std.math.big.int.Managed.init(arena) catch return ParseError.OutOfMemory;
+    bi.setString(radix, clean.items) catch return ParseError.UnexpectedToken;
+    return bi.toString(arena, 10, .lower) catch return ParseError.OutOfMemory;
+}
+
 /// Recursive-descent parser over a shared lexer stream and arena-owned AST.
 pub const Parser = struct {
     lexer: Lexer,
@@ -265,6 +345,9 @@ pub const Parser = struct {
     /// Same contract for `await` inside async function bodies. Off, the
     /// contextual `await` stays an ordinary identifier.
     await_allowed: bool = false,
+    /// Nesting depth inside array/object literals where `CoverInitializedName`
+    /// (`{ x = def }`) may temporarily appear until resolved by `=` or `for-of`/`for-in`.
+    cover_depth: u32 = 0,
     /// Byte-based native-stack-overflow guard, `@frameAddress()`-based --
     /// same idiom as z-interpreter's `evalExpression` stack guard (see
     /// `/home/sweb/.plans/z-parser-improve.md`). `0` (the default)
@@ -483,12 +566,26 @@ pub const Parser = struct {
         if (assignOpFor(self.current.type)) |op| {
             const target_ok = if (op == .assign and (left.data == .array_literal or left.data == .object_literal))
                 isValidAssignmentPattern(left)
-            else
-                isValidAssignmentTarget(left);
+            else blk_at: {
+                if (containsCoverInitName(left)) break :blk_at false;
+                break :blk_at isValidAssignmentTarget(left);
+            };
             if (!target_ok) return ParseError.InvalidAssignmentTarget;
             try self.advance();
+            const saved_cover = self.cover_depth;
+            self.cover_depth = 0;
+            defer self.cover_depth = saved_cover;
             const right = try self.parseAssignment(); // right-associative
             return self.newNode(left.start, right.end, .{ .assignment = .{ .op = op, .target = left, .value = right } });
+        }
+        if (self.cover_depth == 0 and containsCoverInitName(left)) {
+            const is_for_of = self.current.type == .identifier and
+                std.mem.eql(u8, self.current.owned_value orelse self.current.lexeme, "of");
+            const is_for_in = self.current.type == .punct_rparen and
+                left.data == .binary and left.data.binary.op == .in and
+                (left.data.binary.left.data == .array_literal or left.data.binary.left.data == .object_literal) and
+                !containsCoverInitName(left.data.binary.right);
+            if (!is_for_of and !is_for_in) return ParseError.UnexpectedToken;
         }
         return left;
     }
@@ -808,6 +905,9 @@ pub const Parser = struct {
             .punct_lparen => {
                 const start = tok.start;
                 try self.advance();
+                const saved_cover = self.cover_depth;
+                self.cover_depth = 0;
+                defer self.cover_depth = saved_cover;
                 const expr = try self.parseExpression();
                 const end = self.current.end;
                 _ = try self.expect(.punct_rparen);
@@ -834,6 +934,8 @@ pub const Parser = struct {
     fn parseArrayLiteral(self: *Parser) ParseError!*Node {
         const start = self.current.start;
         try self.advance(); // '['
+        self.cover_depth += 1;
+        defer self.cover_depth -= 1;
         var elements: std.ArrayList(?*Node) = .empty;
         while (self.current.type != .punct_rbracket) {
             if (self.current.type == .punct_comma) {
@@ -859,6 +961,8 @@ pub const Parser = struct {
     fn parseObjectLiteral(self: *Parser) ParseError!*Node {
         const start = self.current.start;
         try self.advance(); // '{'
+        self.cover_depth += 1;
+        defer self.cover_depth -= 1;
         var elements: std.ArrayList(ast.ObjectLiteralElement) = .empty;
         while (self.current.type != .punct_rbrace) {
             if (self.current.type == .punct_ellipsis) {
@@ -884,6 +988,9 @@ pub const Parser = struct {
     fn parsePropertyKey(self: *Parser) ParseError!ParsedKey {
         if (self.current.type == .punct_lbracket) {
             try self.advance();
+            const saved_cover = self.cover_depth;
+            self.cover_depth = 0;
+            defer self.cover_depth = saved_cover;
             const key = try self.parseAssignment();
             _ = try self.expect(.punct_rbracket);
             return .{ .key = key, .computed = true, .name = "" };
@@ -906,6 +1013,13 @@ pub const Parser = struct {
                 const key = try self.newNode(tok.start, tok.end, .{ .number_literal = tok.numeric_value.? });
                 try self.advance();
                 return .{ .key = key, .computed = false, .name = "" };
+            },
+            .bigint_literal => {
+                const raw = tok.owned_value orelse tok.lexeme;
+                const dec = try formatBigIntKey(self.arena, raw);
+                const key = try self.newNode(tok.start, tok.end, .{ .string_literal = dec });
+                try self.advance();
+                return .{ .key = key, .computed = false, .name = dec };
             },
             else => {
                 // Reserved words are valid (unquoted) property keys too, e.g. `{ if: 1 }`.
@@ -1001,6 +1115,22 @@ pub const Parser = struct {
         if (!parsed.computed and parsed.key.data == .identifier and (self.current.type == .punct_comma or self.current.type == .punct_rbrace)) {
             // Shorthand `{x}` -- value is the same identifier node as the key.
             return .{ .key = parsed.key, .value = parsed.key, .computed = false, .shorthand = true, .kind = .init };
+        }
+        if (!parsed.computed and parsed.key.data == .identifier and self.current.type == .punct_assign) {
+            // CoverInitializedName `{ x = default }` -- valid only inside
+            // destructuring assignment targets or for-of/for-in heads;
+            // rejected by `parseAssignment` if used as a plain object literal.
+            try self.advance(); // '='
+            const saved_cover = self.cover_depth;
+            self.cover_depth = 0;
+            defer self.cover_depth = saved_cover;
+            const init_val = try self.parseAssignment();
+            const assign_node = try self.newNode(parsed.key.start, init_val.end, .{ .assignment = .{
+                .op = .assign,
+                .target = parsed.key,
+                .value = init_val,
+            } });
+            return .{ .key = parsed.key, .value = assign_node, .computed = false, .shorthand = true, .kind = .init };
         }
         _ = try self.expect(.punct_colon);
         const value = try self.parseAssignment();
