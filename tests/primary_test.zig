@@ -144,3 +144,21 @@ test "BigInt literal property keys in object literals" {
     }.check);
     try helpers.expectParseError("({ 1n })", zparser.ParseError.UnexpectedToken);
 }
+
+test "new.target meta-property: gated on new_target_allowed, rejects escapes and assignment" {
+    try helpers.expectParseError("new.target", zparser.ParseError.UnexpectedToken);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var p = try zparser.Parser.init(arena.allocator(), "new . target");
+    p.new_target_allowed = true;
+    const node = try p.parseExpression();
+    try testing.expect(node.data == .new_target);
+
+    var p2 = try zparser.Parser.init(arena.allocator(), "new.\\u0074arget");
+    p2.new_target_allowed = true;
+    try testing.expectError(zparser.ParseError.UnexpectedToken, p2.parseExpression());
+
+    var p3 = try zparser.Parser.init(arena.allocator(), "new.target = 1");
+    p3.new_target_allowed = true;
+    try testing.expectError(zparser.ParseError.InvalidAssignmentTarget, p3.parseExpression());
+}

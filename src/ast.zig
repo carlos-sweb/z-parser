@@ -145,4 +145,8 @@ pub const NodeData = union(enum) {
     /// class bodies -- both shapes fall out of the ordinary call/member
     /// machinery; the interpreter validates placement at runtime.
     super_expr: void,
+    /// `new.target` meta-property (ECMA-262 13.3.12). Only valid inside
+    /// functions, methods, constructors, class field initializers, static
+    /// blocks, or direct `eval` within them (`Parser.new_target_allowed`).
+    new_target: void,
 };

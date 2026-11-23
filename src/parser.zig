@@ -345,6 +345,9 @@ pub const Parser = struct {
     /// Same contract for `await` inside async function bodies. Off, the
     /// contextual `await` stays an ordinary identifier.
     await_allowed: bool = false,
+    /// `new.target` is valid only inside non-arrow function/method/class
+    /// field/static-block scopes (and arrows/direct eval nested in them).
+    new_target_allowed: bool = false,
     /// Nesting depth inside array/object literals where `CoverInitializedName`
     /// (`{ x = def }`) may temporarily appear until resolved by `=` or `for-of`/`for-in`.
     cover_depth: u32 = 0,
@@ -820,17 +823,28 @@ pub const Parser = struct {
         if (self.current.type == .keyword_new) {
             const start = self.current.start;
             try self.advance();
-            // `new`'s own callee never claims a trailing '(' as a nested
-            // call -- that '(' belongs to this `new`, or to nothing.
-            const callee = try self.parseMemberExpressionImpl(false);
-            var end = callee.end;
-            var args: ?[]const *Node = null;
-            if (self.current.type == .punct_lparen) {
-                const parsed = try self.parseArguments();
-                args = parsed.args;
-                end = parsed.end;
+            if (self.current.type == .punct_dot) {
+                try self.advance();
+                if (self.current.type != .identifier or (self.current.end - self.current.start) != 6 or !std.mem.eql(u8, self.current.lexeme, "target")) {
+                    return ParseError.UnexpectedToken;
+                }
+                if (!self.new_target_allowed) return ParseError.UnexpectedToken;
+                const end = self.current.end;
+                try self.advance();
+                base = try self.newNode(start, end, .{ .new_target = {} });
+            } else {
+                // `new`'s own callee never claims a trailing '(' as a nested
+                // call -- that '(' belongs to this `new`, or to nothing.
+                const callee = try self.parseMemberExpressionImpl(false);
+                var end = callee.end;
+                var args: ?[]const *Node = null;
+                if (self.current.type == .punct_lparen) {
+                    const parsed = try self.parseArguments();
+                    args = parsed.args;
+                    end = parsed.end;
+                }
+                base = try self.newNode(start, end, .{ .new_expr = .{ .callee = callee, .args = args } });
             }
-            base = try self.newNode(start, end, .{ .new_expr = .{ .callee = callee, .args = args } });
         } else {
             base = try self.parsePrimary();
         }
