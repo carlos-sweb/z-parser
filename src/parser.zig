@@ -299,6 +299,11 @@ fn containsCoverInitName(node: *const Node) bool {
             for (t.expressions) |e| if (containsCoverInitName(e)) break :blk true;
             break :blk false;
         },
+        .tagged_template => |t| blk: {
+            if (containsCoverInitName(t.tag)) break :blk true;
+            for (t.expressions) |e| if (containsCoverInitName(e)) break :blk true;
+            break :blk false;
+        },
         .yield_expr => |y| if (y.argument) |a| containsCoverInitName(a) else false,
         else => false,
     };
@@ -351,6 +356,10 @@ pub const Parser = struct {
     /// Nesting depth inside array/object literals where `CoverInitializedName`
     /// (`{ x = def }`) may temporarily appear until resolved by `=` or `for-of`/`for-in`.
     cover_depth: u32 = 0,
+    /// True when `self.current` is a template head/no-sub token whose raw
+    /// source contains an escape sequence rejected by z-lexer (valid only
+    /// inside a tagged template, where `cooked[i]` becomes `null`).
+    current_template_invalid_escape: bool = false,
     /// Byte-based native-stack-overflow guard, `@frameAddress()`-based --
     /// same idiom as z-interpreter's `evalExpression` stack guard (see
     /// `/home/sweb/.plans/z-parser-improve.md`). `0` (the default)
@@ -399,7 +408,19 @@ pub const Parser = struct {
     /// statement parser) needs to drive the lexer through a context this
     /// parser has no way to infer on its own.
     pub fn advanceWithContext(self: *Parser, ctx: LexContext) ParseError!void {
-        self.current = try self.lexer.nextToken(ctx);
+        const saved = self.lexer.checkpoint();
+        self.current_template_invalid_escape = false;
+        self.current = self.lexer.nextToken(ctx) catch |err| switch (err) {
+            error.InvalidEscapeSequence, error.InvalidUnicodeEscape => blk: {
+                self.lexer.restore(saved);
+                if (try self.tryScanRawTemplateHead()) |tok| {
+                    self.current_template_invalid_escape = true;
+                    break :blk tok;
+                }
+                return err;
+            },
+            else => return err,
+        };
     }
 
     /// Consumes and returns `current` when its type matches `t`, otherwise
@@ -417,9 +438,11 @@ pub const Parser = struct {
     pub fn peekNextType(self: *Parser) ParseError!TokenType {
         const saved_lexer = self.lexer.checkpoint();
         const saved_current = self.current;
+        const saved_inv = self.current_template_invalid_escape;
         defer {
             self.lexer.restore(saved_lexer);
             self.current = saved_current;
+            self.current_template_invalid_escape = saved_inv;
         }
         try self.advance();
         return self.current.type;
@@ -435,16 +458,58 @@ pub const Parser = struct {
     fn scanConfirmsArrow(self: *Parser) ParseError!bool {
         const saved_lexer = self.lexer.checkpoint();
         const saved_current = self.current;
+        const saved_inv = self.current_template_invalid_escape;
         defer {
             self.lexer.restore(saved_lexer);
             self.current = saved_current;
+            self.current_template_invalid_escape = saved_inv;
         }
         var depth: i32 = 1;
+        var tmpl_braces: [32]i32 = undefined;
+        var tmpl_depth: usize = 0;
         try self.advance(); // past the opening '('
         while (depth > 0) {
             switch (self.current.type) {
                 .punct_lparen => depth += 1,
                 .punct_rparen => depth -= 1,
+                .template_head => {
+                    if (tmpl_depth < tmpl_braces.len) {
+                        tmpl_braces[tmpl_depth] = 0;
+                        tmpl_depth += 1;
+                    }
+                    try self.advanceWithContext(.regex_allowed);
+                    continue;
+                },
+                .punct_lbrace => {
+                    if (tmpl_depth > 0) tmpl_braces[tmpl_depth - 1] += 1;
+                },
+                .punct_rbrace => {
+                    if (tmpl_depth > 0) {
+                        if (tmpl_braces[tmpl_depth - 1] > 0) {
+                            tmpl_braces[tmpl_depth - 1] -= 1;
+                        } else {
+                            self.lexer.pos = self.current.start;
+                            self.lexer.line = self.current.line;
+                            self.lexer.column = self.current.column;
+                            const saved_cont = self.lexer.checkpoint();
+                            const tok = self.lexer.continueTemplate() catch |err| switch (err) {
+                                error.InvalidEscapeSequence, error.InvalidUnicodeEscape => blk: {
+                                    self.lexer.restore(saved_cont);
+                                    break :blk try self.scanRawTemplatePart(false, false);
+                                },
+                                else => return false,
+                            };
+                            if (tok.type == .template_tail) {
+                                tmpl_depth -= 1;
+                                const ctx: LexContext = if (regexAllowedAfter(tok.type)) .regex_allowed else .div_allowed;
+                                try self.advanceWithContext(ctx);
+                            } else {
+                                try self.advanceWithContext(.regex_allowed);
+                            }
+                            continue;
+                        }
+                    }
+                },
                 .eof => return false,
                 else => {},
             }
@@ -781,6 +846,7 @@ pub const Parser = struct {
     /// never to a nested call baked into the callee.
     fn parseMemberSuffixes(self: *Parser, base_in: *Node, comptime allow_calls: bool) ParseError!*Node {
         var base = base_in;
+        var in_optional_chain = false;
         while (true) {
             if (self.current.type == .punct_dot) {
                 try self.advance();
@@ -793,6 +859,7 @@ pub const Parser = struct {
                 _ = try self.expect(.punct_rbracket);
                 base = try self.newNode(base.start, end, .{ .member = .{ .object = base, .property = prop, .computed = true, .optional = false } });
             } else if (allow_calls and self.current.type == .punct_question_dot) {
+                in_optional_chain = true;
                 try self.advance();
                 if (self.current.type == .punct_lbracket) {
                     try self.advance();
@@ -810,6 +877,10 @@ pub const Parser = struct {
             } else if (allow_calls and self.current.type == .punct_lparen) {
                 const parsed = try self.parseArguments();
                 base = try self.newNode(base.start, parsed.end, .{ .call = .{ .callee = base, .args = parsed.args, .optional = false } });
+            } else if (allow_calls and (self.current.type == .template_no_substitution or self.current.type == .template_head)) {
+                if (in_optional_chain) return ParseError.UnexpectedToken;
+                if (base.data == .new_expr and base.data.new_expr.args == null) return ParseError.UnexpectedToken;
+                base = try self.parseTaggedTemplate(base);
             } else {
                 break;
             }
@@ -1153,8 +1224,7 @@ pub const Parser = struct {
 
     // ===== Template literals =====
 
-    fn templateContent(tok: Token) []const u8 {
-        if (tok.owned_value) |v| return v;
+    fn rawInner(tok: Token) []const u8 {
         var s = tok.lexeme[1..]; // strip leading '`' or '}'
         if (tok.type == .template_head or tok.type == .template_middle) {
             s = s[0 .. s.len - 2]; // strip trailing "${"
@@ -1162,6 +1232,188 @@ pub const Parser = struct {
             s = s[0 .. s.len - 1]; // strip trailing '`'
         }
         return s;
+    }
+
+    fn templateRawContent(arena: Allocator, tok: Token) ParseError![]const u8 {
+        const inner = rawInner(tok);
+        if (std.mem.indexOfScalar(u8, inner, '\r') == null) return inner;
+        var out: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < inner.len) {
+            if (inner[i] == '\r') {
+                try out.append(arena, '\n');
+                i += 1;
+                if (i < inner.len and inner[i] == '\n') i += 1;
+            } else {
+                try out.append(arena, inner[i]);
+                i += 1;
+            }
+        }
+        return try out.toOwnedSlice(arena);
+    }
+
+    /// Returns true if `inner` (the raw template segment between delimiters)
+    /// contains a legacy octal or non-octal decimal escape (`\1`..`\9`, or
+    /// `\0` followed by any ASCII digit), which ECMA-262 12.9.6 forbids in
+    /// untagged templates and turns into `cooked = null` in tagged templates.
+    fn hasInvalidTemplateEscape(inner: []const u8) bool {
+        var i: usize = 0;
+        while (i < inner.len) {
+            if (inner[i] == '\\') {
+                if (i + 1 >= inner.len) return true;
+                const c = inner[i + 1];
+                if (c >= '1' and c <= '9') return true;
+                if (c == '0' and i + 2 < inner.len and inner[i + 2] >= '0' and inner[i + 2] <= '9') return true;
+                if (c == '\r' and i + 2 < inner.len and inner[i + 2] == '\n') {
+                    i += 3;
+                } else {
+                    i += 2;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        return false;
+    }
+
+    fn tryScanRawTemplateHead(self: *Parser) ParseError!?Token {
+        const src = self.lexer.source;
+        var had_lt = false;
+        while (self.lexer.pos < src.len) {
+            const c = src[self.lexer.pos];
+            if (c == ' ' or c == '\t' or c == 0x0B or c == 0x0C) {
+                self.lexer.pos += 1;
+                self.lexer.column += 1;
+            } else if (c == '\n') {
+                self.lexer.pos += 1;
+                self.lexer.line += 1;
+                self.lexer.column = 1;
+                had_lt = true;
+            } else if (c == '\r') {
+                self.lexer.pos += 1;
+                if (self.lexer.pos < src.len and src[self.lexer.pos] == '\n') self.lexer.pos += 1;
+                self.lexer.line += 1;
+                self.lexer.column = 1;
+                had_lt = true;
+            } else if (c == 0xE2 and self.lexer.pos + 2 < src.len and src[self.lexer.pos + 1] == 0x80 and (src[self.lexer.pos + 2] == 0xA8 or src[self.lexer.pos + 2] == 0xA9)) {
+                self.lexer.pos += 3;
+                self.lexer.line += 1;
+                self.lexer.column = 1;
+                had_lt = true;
+            } else if (c == '/' and self.lexer.pos + 1 < src.len and src[self.lexer.pos + 1] == '/') {
+                self.lexer.pos += 2;
+                self.lexer.column += 2;
+                while (self.lexer.pos < src.len and src[self.lexer.pos] != '\n' and src[self.lexer.pos] != '\r') {
+                    self.lexer.pos += 1;
+                    self.lexer.column += 1;
+                }
+            } else if (c == '/' and self.lexer.pos + 1 < src.len and src[self.lexer.pos + 1] == '*') {
+                self.lexer.pos += 2;
+                self.lexer.column += 2;
+                while (self.lexer.pos + 1 < src.len and !(src[self.lexer.pos] == '*' and src[self.lexer.pos + 1] == '/')) {
+                    if (src[self.lexer.pos] == '\n') {
+                        self.lexer.pos += 1;
+                        self.lexer.line += 1;
+                        self.lexer.column = 1;
+                        had_lt = true;
+                    } else if (src[self.lexer.pos] == '\r') {
+                        self.lexer.pos += 1;
+                        if (self.lexer.pos < src.len and src[self.lexer.pos] == '\n') self.lexer.pos += 1;
+                        self.lexer.line += 1;
+                        self.lexer.column = 1;
+                        had_lt = true;
+                    } else {
+                        self.lexer.pos += 1;
+                        self.lexer.column += 1;
+                    }
+                }
+                if (self.lexer.pos + 1 < src.len) {
+                    self.lexer.pos += 2;
+                    self.lexer.column += 2;
+                }
+            } else {
+                break;
+            }
+        }
+        if (self.lexer.pos >= src.len or src[self.lexer.pos] != '`') return null;
+        return try self.scanRawTemplatePart(true, had_lt);
+    }
+
+    fn scanRawTemplatePart(self: *Parser, is_head: bool, had_lt: bool) ParseError!Token {
+        const src = self.lexer.source;
+        const start = self.lexer.pos;
+        const line = self.lexer.line;
+        const col = self.lexer.column;
+        self.lexer.pos += 1; // leading '`' or '}'
+        self.lexer.column += 1;
+        while (self.lexer.pos < src.len) {
+            const c = src[self.lexer.pos];
+            if (c == '`') {
+                self.lexer.pos += 1;
+                self.lexer.column += 1;
+                return .{
+                    .type = if (is_head) .template_no_substitution else .template_tail,
+                    .lexeme = src[start..self.lexer.pos],
+                    .start = start,
+                    .end = self.lexer.pos,
+                    .line = line,
+                    .column = col,
+                    .had_line_terminator_before = had_lt,
+                };
+            }
+            if (c == '$' and self.lexer.pos + 1 < src.len and src[self.lexer.pos + 1] == '{') {
+                self.lexer.pos += 2;
+                self.lexer.column += 2;
+                return .{
+                    .type = if (is_head) .template_head else .template_middle,
+                    .lexeme = src[start..self.lexer.pos],
+                    .start = start,
+                    .end = self.lexer.pos,
+                    .line = line,
+                    .column = col,
+                    .had_line_terminator_before = had_lt,
+                };
+            }
+            if (c == '\\') {
+                self.lexer.pos += 1;
+                self.lexer.column += 1;
+                if (self.lexer.pos >= src.len) return ParseError.UnterminatedTemplate;
+                const esc = src[self.lexer.pos];
+                if (esc == '\r') {
+                    self.lexer.pos += 1;
+                    if (self.lexer.pos < src.len and src[self.lexer.pos] == '\n') self.lexer.pos += 1;
+                    self.lexer.line += 1;
+                    self.lexer.column = 1;
+                } else if (esc == '\n') {
+                    self.lexer.pos += 1;
+                    self.lexer.line += 1;
+                    self.lexer.column = 1;
+                } else {
+                    self.lexer.pos += 1;
+                    self.lexer.column += 1;
+                }
+                continue;
+            }
+            if (c == '\r') {
+                self.lexer.pos += 1;
+                if (self.lexer.pos < src.len and src[self.lexer.pos] == '\n') self.lexer.pos += 1;
+                self.lexer.line += 1;
+                self.lexer.column = 1;
+            } else if (c == '\n') {
+                self.lexer.pos += 1;
+                self.lexer.line += 1;
+                self.lexer.column = 1;
+            } else {
+                self.lexer.pos += 1;
+                self.lexer.column += 1;
+            }
+        }
+        return ParseError.UnterminatedTemplate;
+    }
+
+    fn templateContent(tok: Token) []const u8 {
+        if (tok.owned_value) |v| return v;
+        return rawInner(tok);
     }
 
     /// Implements the same lexer/parser cooperation pattern proven by
@@ -1179,6 +1431,9 @@ pub const Parser = struct {
         var expressions: std.ArrayList(*Node) = .empty;
 
         var tok = self.current;
+        if (self.current_template_invalid_escape or hasInvalidTemplateEscape(rawInner(tok))) {
+            return ParseError.InvalidEscapeSequence;
+        }
         try quasis.append(self.arena, templateContent(tok));
 
         if (tok.type == .template_no_substitution) {
@@ -1190,7 +1445,7 @@ pub const Parser = struct {
             } });
         }
 
-        self.current = try self.lexer.nextToken(.regex_allowed); // enter the first substitution
+        try self.advanceWithContext(.regex_allowed); // enter the first substitution
         while (true) {
             try expressions.append(self.arena, try self.parseExpression());
 
@@ -1199,18 +1454,77 @@ pub const Parser = struct {
             self.lexer.line = self.current.line;
             self.lexer.column = self.current.column;
             tok = try self.lexer.continueTemplate();
+            if (hasInvalidTemplateEscape(rawInner(tok))) return ParseError.InvalidEscapeSequence;
             try quasis.append(self.arena, templateContent(tok));
 
             if (tok.type == .template_tail) {
                 const end = tok.end;
                 const ctx: LexContext = if (regexAllowedAfter(tok.type)) .regex_allowed else .div_allowed;
-                self.current = try self.lexer.nextToken(ctx);
+                try self.advanceWithContext(ctx);
                 return self.newNode(start, end, .{ .template_literal = .{
                     .quasis = try quasis.toOwnedSlice(self.arena),
                     .expressions = try expressions.toOwnedSlice(self.arena),
                 } });
             }
-            self.current = try self.lexer.nextToken(.regex_allowed); // template_middle: another substitution follows
+            try self.advanceWithContext(.regex_allowed); // template_middle: another substitution follows
+        }
+    }
+
+    fn parseTaggedTemplate(self: *Parser, tag: *Node) ParseError!*Node {
+        var cooked: std.ArrayList(?[]const u8) = .empty;
+        var raw: std.ArrayList([]const u8) = .empty;
+        var expressions: std.ArrayList(*Node) = .empty;
+
+        var tok = self.current;
+        const first_invalid = self.current_template_invalid_escape or hasInvalidTemplateEscape(rawInner(tok));
+        try raw.append(self.arena, try templateRawContent(self.arena, tok));
+        try cooked.append(self.arena, if (first_invalid) null else templateContent(tok));
+
+        if (tok.type == .template_no_substitution) {
+            const end = tok.end;
+            try self.advance();
+            return self.newNode(tag.start, end, .{ .tagged_template = .{
+                .tag = tag,
+                .cooked = try cooked.toOwnedSlice(self.arena),
+                .raw = try raw.toOwnedSlice(self.arena),
+                .expressions = try expressions.toOwnedSlice(self.arena),
+            } });
+        }
+
+        try self.advanceWithContext(.regex_allowed);
+        while (true) {
+            try expressions.append(self.arena, try self.parseExpression());
+
+            if (self.current.type != .punct_rbrace) return ParseError.UnexpectedToken;
+            self.lexer.pos = self.current.start;
+            self.lexer.line = self.current.line;
+            self.lexer.column = self.current.column;
+            const saved_cont = self.lexer.checkpoint();
+            var part_invalid = false;
+            tok = self.lexer.continueTemplate() catch |err| switch (err) {
+                error.InvalidEscapeSequence, error.InvalidUnicodeEscape => blk: {
+                    self.lexer.restore(saved_cont);
+                    part_invalid = true;
+                    break :blk try self.scanRawTemplatePart(false, false);
+                },
+                else => return err,
+            };
+            if (!part_invalid and hasInvalidTemplateEscape(rawInner(tok))) part_invalid = true;
+            try raw.append(self.arena, try templateRawContent(self.arena, tok));
+            try cooked.append(self.arena, if (part_invalid) null else templateContent(tok));
+
+            if (tok.type == .template_tail) {
+                const end = tok.end;
+                const ctx: LexContext = if (regexAllowedAfter(tok.type)) .regex_allowed else .div_allowed;
+                try self.advanceWithContext(ctx);
+                return self.newNode(tag.start, end, .{ .tagged_template = .{
+                    .tag = tag,
+                    .cooked = try cooked.toOwnedSlice(self.arena),
+                    .raw = try raw.toOwnedSlice(self.arena),
+                    .expressions = try expressions.toOwnedSlice(self.arena),
+                } });
+            }
+            try self.advanceWithContext(.regex_allowed);
         }
     }
 };

@@ -81,3 +81,53 @@ test "escape sequence inside a template quasi" {
         }
     }.check);
 }
+
+test "tagged template: basic, chained, and raw vs cooked" {
+    try helpers.parseAndCheck("obj.tag`a\\nb${1}c`", {}, struct {
+        fn check(_: void, node: *zparser.Node) !void {
+            try testing.expect(node.data == .tagged_template);
+            const tt = node.data.tagged_template;
+            try testing.expect(tt.tag.data == .member);
+            try testing.expectEqual(@as(usize, 2), tt.cooked.len);
+            try testing.expectEqualStrings("a\nb", tt.cooked[0].?);
+            try testing.expectEqualStrings("a\\nb", tt.raw[0]);
+            try testing.expectEqualStrings("c", tt.cooked[1].?);
+            try testing.expectEqual(@as(usize, 1), tt.expressions.len);
+        }
+    }.check);
+
+    try helpers.parseAndCheck("tag`a``b`.prop()", {}, struct {
+        fn check(_: void, node: *zparser.Node) !void {
+            try testing.expect(node.data == .call);
+            try testing.expect(node.data.call.callee.data == .member);
+            try testing.expect(node.data.call.callee.data.member.object.data == .tagged_template);
+            try testing.expect(node.data.call.callee.data.member.object.data.tagged_template.tag.data == .tagged_template);
+        }
+    }.check);
+}
+
+test "tagged template: invalid escapes produce null cooked and preserve raw, untagged rejects" {
+    try helpers.parseAndCheck("tag`\\unicode${1}\\x1\\8\\01`", {}, struct {
+        fn check(_: void, node: *zparser.Node) !void {
+            const tt = node.data.tagged_template;
+            try testing.expectEqual(@as(usize, 2), tt.cooked.len);
+            try testing.expect(tt.cooked[0] == null);
+            try testing.expectEqualStrings("\\unicode", tt.raw[0]);
+            try testing.expect(tt.cooked[1] == null);
+            try testing.expectEqualStrings("\\x1\\8\\01", tt.raw[1]);
+        }
+    }.check);
+
+    try helpers.parseAndCheck("tag`a\r\nb\rc`", {}, struct {
+        fn check(_: void, node: *zparser.Node) !void {
+            const tt = node.data.tagged_template;
+            try testing.expectEqualStrings("a\nb\nc", tt.raw[0]);
+            try testing.expectEqualStrings("a\nb\nc", tt.cooked[0].?);
+        }
+    }.check);
+
+    try helpers.expectParseError("(`\\unicode`)", zparser.ParseError.InvalidEscapeSequence);
+    try helpers.expectParseError("`\\8`", zparser.ParseError.InvalidEscapeSequence);
+    try helpers.expectParseError("new tag`a`", zparser.ParseError.UnexpectedToken);
+    try helpers.expectParseError("a?.b`x`", zparser.ParseError.UnexpectedToken);
+}

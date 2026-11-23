@@ -100,6 +100,15 @@ pub const NodeData = union(enum) {
         quasis: []const []const u8,
         expressions: []const *Node,
     },
+    tagged_template: struct {
+        tag: *Node,
+        /// cooked.len == raw.len == expressions.len + 1.
+        /// `null` entry = invalid escape sequence in a tagged template
+        /// (ECMA-262 12.9.6: evaluates to `undefined` in `templateObj[i]`).
+        cooked: []const ?[]const u8,
+        raw: []const []const u8,
+        expressions: []const *Node,
+    },
     /// null element = an elision hole, e.g. the middle of `[1,,3]`.
     array_literal: []const ?*Node,
     object_literal: []const ObjectLiteralElement,
